@@ -1,0 +1,84 @@
+from AlgorithmImports import *
+from datetime import timedelta
+
+class DeltaIVRotation(QCAlgorithm):
+    def Initialize(self):
+        self.SetStartDate(2021, 1, 1)
+        self.SetEndDate(2025, 1, 1)
+        self.SetCash(100000)
+
+        self.tickers = ["AAPL", "MSFT", "NFLX"]
+        self.equitySymbols, self.optionSymbols = {}, {}
+        self.currentHolding = None
+        self.lastRebalanceMonth = -1  # do monthly inside OnData when chains are present
+
+        # Subscribe to equities and options (RAW is auto-set for options)
+        for t in self.tickers:
+            eq = self.AddEquity(t, Resolution.Minute)
+            opt = self.AddOption(t, Resolution.Minute)
+            # ~1y expiries; +/-10 strikes
+            opt.SetFilter(-10, +10, timedelta(300), timedelta(400))
+            self.equitySymbols[t] = eq.Symbol
+            self.optionSymbols[t] = opt.Symbol
+
+        # Warm up some minutes so chains/greeks have time to materialize
+        self.SetWarmUp(timedelta(days=5))
+
+    def OnData(self, data: Slice):
+        # Only act once per calendar month when we actually have option chains in the slice
+        if self.IsWarmingUp:
+            return
+        if self.lastRebalanceMonth == self.Time.month:
+            return
+
+        # Ensure we have chains for ALL (or at least one) before attempting
+        have_any_chain = any(sym in data.OptionChains for sym in self.optionSymbols.values())
+        if not have_any_chain:
+            return  # wait until chains arrive in a real slice
+
+        best_score, best_ticker = float('-inf'), None
+
+        for t in self.tickers:
+            opt_sym = self.optionSymbols[t]
+            chain = data.OptionChains.get(opt_sym)
+            if chain is None:
+                continue
+
+            price = self.Securities[self.equitySymbols[t]].Price
+            if price <= 0:
+                continue
+            target = round(price * 1.05, 2)
+
+            # filter to ~1y calls nearest 5% OTM
+            calls = [c for c in chain if c.Right == OptionRight.Call
+                     and (c.Expiry - self.Time).days > 300
+                     and abs(c.Strike - target) < 2]
+            if not calls:
+                continue
+            call = min(calls, key=lambda c: abs(c.Strike - target))
+
+            # Prefer contract Greeks/IV; if missing, subscribe to the contract and skip this month
+            delta = call.Greeks.Delta if call.Greeks is not None else None
+            iv = call.ImpliedVolatility
+            if delta is None or iv is None or iv == 0:
+                self.AddOptionContract(call.Symbol)
+                self.Debug(f"Subscribed to {t} contract {call.Symbol} for Greeks/IV; will evaluate next slice/month")
+                continue
+
+            score = abs(float(delta)) / float(iv)
+            self.Debug(f"{t}: Δ={float(delta):.3f}, IV={float(iv):.3f}, score={score:.3f}")
+            if score > best_score:
+                best_score, best_ticker = score, t
+
+        if best_ticker is None:
+            return  # no valid readings yet
+
+        # Rotate if needed
+        if best_ticker != self.currentHolding:
+            self.Debug(f"Rotating into {best_ticker} (score {best_score:.3f}) on {self.Time}")
+            self.Liquidate()
+            self.SetHoldings(self.equitySymbols[best_ticker], 1.0)
+            self.currentHolding = best_ticker
+
+        # mark month as processed
+        self.lastRebalanceMonth = self.Time.month
