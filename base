@@ -1,84 +1,301 @@
 from AlgorithmImports import *
 from datetime import timedelta
 
-class DeltaIVRotation(QCAlgorithm):
+class DeltaIVTop3_Aggressive(QCAlgorithm):
     def Initialize(self):
-        self.SetStartDate(2021, 1, 1)
+        # Backtest window and capital
+        self.SetStartDate(2017, 1, 1)
         self.SetEndDate(2025, 1, 1)
         self.SetCash(100000)
 
-        self.tickers = ["AAPL", "MSFT", "NFLX"]
-        self.equitySymbols, self.optionSymbols = {}, {}
-        self.currentHolding = None
-        self.lastRebalanceMonth = -1  # do monthly inside OnData when chains are present
+        # Universe
+        self.tickers = [
+            "AAPL", "MSFT", "NFLX", "GOOGL", "AMZN", "TSLA", "AVGO", "META",
+            "WMT", "JPM", "ORCL", "V", "LLY", "MA", "DIS", "XOM", "PLTR", "COST",
+            "JNJ", "HD", "PG", "ABBV", "BAC", "CVX", "KO", "GE", "NVDA"
+        ]
 
-        # Subscribe to equities and options (RAW is auto-set for options)
+        # Equities on MINUTE (so spot is available right after the open)
+        self.equitySymbols = {}
         for t in self.tickers:
             eq = self.AddEquity(t, Resolution.Minute)
-            opt = self.AddOption(t, Resolution.Minute)
-            # ~1y expiries; +/-10 strikes
-            opt.SetFilter(-10, +10, timedelta(300), timedelta(400))
             self.equitySymbols[t] = eq.Symbol
-            self.optionSymbols[t] = opt.Symbol
 
-        # Warm up some minutes so chains/greeks have time to materialize
-        self.SetWarmUp(timedelta(days=5))
+        # Buy & Hold benchmark (equal-weight across ALL tickers)
+        self.bh_initialized = False
+        self.bh_shares = {t: 0.0 for t in self.tickers}
+        self.bh_value = 0.0
+        self.bh_start_value = float(self.Portfolio.Cash)
+
+        # Monthly window state
+        self.windowOpen = False
+        self.monthlyDone = True
+        self.windowHadDecision = False
+        self.scores = {}         # ticker -> score
+        self.reasons = {}        # ticker -> reason
+        self.targets = {}        # ticker -> chosen CONTRACT Symbol
+        self.optionSymbols = {}  # ticker -> canonical OPTION Symbol (only inside window)
+
+        self.SetWarmUp(timedelta(days=1))  # short warmup
+
+        # Schedules (use AAPL's calendar)
+        ref = self.equitySymbols["AAPL"]
+        # Pre-warm BEFORE the window so Greeks/IV can populate (especially for the first month)
+        self.Schedule.On(self.DateRules.MonthStart(ref), self.TimeRules.At(9, 10), self.PrepareThisMonth)
+        # Open decision window
+        self.Schedule.On(self.DateRules.MonthStart(ref), self.TimeRules.At(9, 35), self.OpenMonthlyWindow)
+        # Close decision window
+        self.Schedule.On(self.DateRules.MonthStart(ref), self.TimeRules.At(11, 0), self.CloseMonthlyWindow)
+
+    # ---------------------- Monthly orchestration ----------------------
+
+    def PrepareThisMonth(self):
+        """9:10 ET: preselect + subscribe contracts so data is ready by 9:35."""
+        self._remove_all_option_subscriptions()
+        self.targets.clear()
+        self.optionSymbols.clear()
+        self.scores.clear()
+        self.reasons.clear()
+
+        picked = self._select_and_subscribe_contracts()
+        self.Debug(f"Pre-warm @ {self.Time}: selected {picked} contracts")
+
+    def OpenMonthlyWindow(self):
+        self.windowOpen = True
+        self.monthlyDone = False
+        self.windowHadDecision = False
+        self.scores.clear()
+        self.reasons.clear()
+        if not self.targets:
+            picked = self._select_and_subscribe_contracts()
+            self.Debug(f"Monthly window OPEN @ {self.Time} | selected {picked} contracts")
+        else:
+            self.Debug(f"Monthly window OPEN @ {self.Time} | pre-warmed targets: {len(self.targets)}")
+
+    def CloseMonthlyWindow(self):
+        if not self.monthlyDone:
+            ordered = sorted(self.scores.items(), key=lambda kv: kv[1], reverse=True)
+            lines = []
+            for t in self.tickers:
+                if t in self.scores:
+                    lines.append(f"{t}:{self.scores[t]:.3f}")
+                else:
+                    lines.append(f"{t}:N/A ({self.reasons.get(t,'missing')})")
+            self.Debug(f"Scores @ {self.Time}: " + ", ".join(lines))
+
+            if ordered:
+                self.RotateHoldings(ordered)
+            else:
+                self.Debug("No valid scores this month — staying in current holdings")
+
+        self.windowOpen = False
+        self.monthlyDone = True
+        self._remove_all_option_subscriptions()
+        self.Debug(f"Monthly window CLOSE @ {self.Time}")
+
+    # ---------------------- Selection & subscriptions ----------------------
+
+    def _select_and_subscribe_contracts(self):
+        """
+        For each ticker:
+          - Add canonical option (minute) for the window
+          - From OptionChainProvider: pick CALL in 21–35 DTE, expiry closest to 30 DTE,
+            strike nearest +2% OTM
+          - Subscribe to the exact contract so Greeks/IV can populate
+        Returns number of chosen contracts.
+        """
+        picked = 0
+        for t in self.tickers:
+            try:
+                opt = self.AddOption(t, Resolution.Minute)
+                # Narrow chain to 21–35 DTE to keep it light
+                opt.SetFilter(-10, +10, timedelta(21), timedelta(35))
+                self.optionSymbols[t] = opt.Symbol
+
+                contracts = list(self.OptionChainProvider.GetOptionContractList(self.equitySymbols[t], self.Time))
+                if not contracts:
+                    self.reasons[t] = "no contracts from provider"
+                    continue
+
+                def dte_days(c): return (c.ID.Date.date() - self.Time.date()).days
+                calls = [c for c in contracts if c.ID.OptionRight == OptionRight.Call and 21 <= dte_days(c) <= 35]
+                if not calls:
+                    self.reasons[t] = "no 21–35d calls"
+                    continue
+
+                # Expiry closest to 30 DTE
+                expiries = {}
+                for c in calls:
+                    expiry = c.ID.Date.date()
+                    expiries[expiry] = (c.ID.Date.date() - self.Time.date()).days
+                best_expiry = min(expiries.items(), key=lambda kv: abs(kv[1] - 30))[0]
+
+                # Strike nearest +2% OTM
+                spot = self.Securities[self.equitySymbols[t]].Price
+                if spot <= 0:
+                    self.reasons[t] = "bad price"
+                    continue
+                target_strike = spot * 1.02
+                same_expiry = [c for c in calls if c.ID.Date.date() == best_expiry]
+                chosen = min(same_expiry, key=lambda s: abs(s.ID.StrikePrice - target_strike))
+
+                self.AddOptionContract(chosen)
+                self.targets[t] = chosen
+                picked += 1
+            except Exception as e:
+                self.reasons[t] = f"provider error: {e}"
+        return picked
+
+    def _remove_all_option_subscriptions(self):
+        # Remove contract subscriptions
+        for sym in list(self.targets.values()):
+            if sym in self.Securities:
+                self.RemoveSecurity(sym)
+        # Remove canonical option subscriptions
+        for sym in list(self.optionSymbols.values()):
+            if sym in self.Securities:
+                self.RemoveSecurity(sym)
+
+    # ---------------------- Scoring (Slice first, DF fallback) ----------------------
+
+    def _score_from_slice(self, t: str, data: Slice):
+        """Use the live Slice chain for the preselected contract."""
+        if t not in self.targets or t not in self.optionSymbols:
+            return None, self.reasons.get(t, "no target/canonical")
+
+        chain = data.OptionChains.get(self.optionSymbols[t])
+        if chain is None:
+            return None, "no chain in slice"
+
+        target_symbol = self.targets[t]
+        contract = next((c for c in chain if c.Symbol == target_symbol), None)
+        if contract is None:
+            return None, "target not in chain yet"
+
+        delta = contract.Greeks.Delta if contract.Greeks is not None else None
+        iv = contract.ImpliedVolatility
+        if delta is None or iv is None or iv == 0:
+            return None, "missing greeks/iv"
+
+        return abs(float(delta)) / float(iv), ""
+
+    def _score_from_provider_df(self, t: str):
+        """
+        Fallback: flattened chain for the canonical option symbol.
+        Robust call filtering; 21–35 DTE; expiry closest to 30 DTE; ~+2% OTM strike.
+        """
+        try:
+            if t not in self.optionSymbols:
+                return None, self.reasons.get(t, "no canonical")
+            df = self.OptionChain(self.optionSymbols[t], flatten=True).data_frame
+            if df is None or df.empty:
+                return None, "empty df"
+
+            # Robust call parsing: 'C' / 'Call' / enums → string, upper, first letter
+            right = df['right'].astype(str).str.upper().str[0]
+            df = df[(right == 'C') & (df['expiry'] > self.Time)]
+            if df.empty:
+                return None, "no calls in df"
+
+            # 21–35 DTE and expiry closest to 30
+            dte = (df['expiry'] - self.Time).dt.days
+            df = df[dte.between(21, 35)]
+            if df.empty:
+                return None, "no 21–35d in df"
+
+            df = df.assign(dte=(df['expiry'] - self.Time).dt.days)
+            target_expiry = df.iloc[(df['dte'] - 30).abs().argsort()].iloc[0]['expiry']
+            sub = df[df['expiry'] == target_expiry]
+            if sub.empty:
+                return None, "no rows at chosen expiry"
+
+            spot = sub['underlyinglastprice'].iloc[0]
+            if not spot or spot <= 0:
+                return None, "bad price df"
+            target = spot * 1.02
+
+            sub = sub.assign(abs_strike_delta=(sub['strike'] - target).abs())
+            row = sub.loc[sub['abs_strike_delta'].idxmin()]
+
+            iv = float(row.get('impliedvolatility', float('nan')))
+            delta = float(row.get('delta', float('nan')))
+            if not (iv and delta) or iv == 0 or (delta != delta) or (iv != iv):
+                return None, "df missing greeks/iv"
+
+            return abs(delta) / iv, ""
+        except Exception as e:
+            return None, f"df error: {e}"
+
+    # ---------------------- OnData ----------------------
 
     def OnData(self, data: Slice):
-        # Only act once per calendar month when we actually have option chains in the slice
-        if self.IsWarmingUp:
+        # Initialize equal-weight buy & hold (no rebalance)
+        if not self.IsWarmingUp and not self.bh_initialized:
+            per = self.bh_start_value / float(len(self.tickers))
+            for t in self.tickers:
+                px = self.Securities[self.equitySymbols[t]].Price
+                if px > 0:
+                    self.bh_shares[t] = per / px
+            self.bh_initialized = True
+
+        # Adjust for splits
+        for kvp in data.Splits:
+            sym = kvp.Key
+            t = next((k for k, v in self.equitySymbols.items() if v == sym), None)
+            if t:
+                self.bh_shares[t] *= kvp.Value.SplitFactor
+
+        # Update B&H value
+        if self.bh_initialized:
+            self.bh_value = sum(self.bh_shares[t] * self.Securities[self.equitySymbols[t]].Price for t in self.tickers)
+
+        # Only evaluate during the monthly window
+        if self.IsWarmingUp or not self.windowOpen or self.monthlyDone:
             return
-        if self.lastRebalanceMonth == self.Time.month:
-            return
 
-        # Ensure we have chains for ALL (or at least one) before attempting
-        have_any_chain = any(sym in data.OptionChains for sym in self.optionSymbols.values())
-        if not have_any_chain:
-            return  # wait until chains arrive in a real slice
-
-        best_score, best_ticker = float('-inf'), None
-
+        # Compute scores (slice first, then DF fallback)
         for t in self.tickers:
-            opt_sym = self.optionSymbols[t]
-            chain = data.OptionChains.get(opt_sym)
-            if chain is None:
+            if t in self.scores or t in self.reasons:
                 continue
 
-            price = self.Securities[self.equitySymbols[t]].Price
-            if price <= 0:
-                continue
-            target = round(price * 1.05, 2)
+            score, reason = self._score_from_slice(t, data)
+            if score is None:
+                score, reason = self._score_from_provider_df(t)
 
-            # filter to ~1y calls nearest 5% OTM
-            calls = [c for c in chain if c.Right == OptionRight.Call
-                     and (c.Expiry - self.Time).days > 300
-                     and abs(c.Strike - target) < 2]
-            if not calls:
-                continue
-            call = min(calls, key=lambda c: abs(c.Strike - target))
+            if score is not None:
+                self.scores[t] = score
+            else:
+                self.reasons[t] = reason
 
-            # Prefer contract Greeks/IV; if missing, subscribe to the contract and skip this month
-            delta = call.Greeks.Delta if call.Greeks is not None else None
-            iv = call.ImpliedVolatility
-            if delta is None or iv is None or iv == 0:
-                self.AddOptionContract(call.Symbol)
-                self.Debug(f"Subscribed to {t} contract {call.Symbol} for Greeks/IV; will evaluate next slice/month")
-                continue
+        # Trade as soon as we have any scores
+        if self.scores and not self.windowHadDecision:
+            ordered = sorted(self.scores.items(), key=lambda kv: kv[1], reverse=True)
+            self.RotateHoldings(ordered)
+            self.monthlyDone = True
+            self.windowHadDecision = True
+            self.windowOpen = False
 
-            score = abs(float(delta)) / float(iv)
-            self.Debug(f"{t}: Δ={float(delta):.3f}, IV={float(iv):.3f}, score={score:.3f}")
-            if score > best_score:
-                best_score, best_ticker = score, t
+    # ---------------------- Rotation (Top 3: 60/20/20) ----------------------
 
-        if best_ticker is None:
-            return  # no valid readings yet
+    def RotateHoldings(self, ranked_scores):
+        top = ranked_scores[:3]
+        picks = [t for t, _ in top]
+        weights = [0.34, 0.33, 0.33][:len(top)]
+        # Normalize if fewer than 3
+        s = sum(weights)
+        if s != 1.0:
+            weights = [w / s for w in weights]
 
-        # Rotate if needed
-        if best_ticker != self.currentHolding:
-            self.Debug(f"Rotating into {best_ticker} (score {best_score:.3f}) on {self.Time}")
-            self.Liquidate()
-            self.SetHoldings(self.equitySymbols[best_ticker], 1.0)
-            self.currentHolding = best_ticker
+        self.Liquidate()
+        for t, w in zip(picks, weights):
+            self.SetHoldings(self.equitySymbols[t], w)
+        self.Debug(f"Rotating into (Top 3): {list(zip(picks, [round(w,3) for w in weights]))}")
 
-        # mark month as processed
-        self.lastRebalanceMonth = self.Time.month
+    # ---------------------- End-of-Algorithm Reporting ----------------------
+
+    def OnEndOfAlgorithm(self):
+        if self.bh_initialized and self.bh_start_value > 0:
+            bh_ret = (self.bh_value / self.bh_start_value) - 1.0
+            strat_ret = (self.Portfolio.TotalPortfolioValue / self.bh_start_value) - 1.0
+            self.Debug(f"Buy&Hold return (equal-weight, all tickers): {bh_ret:.2%}")
+            self.Debug(f"Strategy return: {strat_ret:.2%}")
