@@ -1,0 +1,308 @@
+from AlgorithmImports import *
+from datetime import timedelta, date
+
+class DeltaIVTop3_Biweekly_ShortDTE(QCAlgorithm):
+    def Initialize(self):
+        # Backtest window and capital
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2025, 1, 1)
+        self.SetCash(100000)
+
+        # Universe (expanded)
+        self.tickers = [
+            # original set
+            "AAPL","MSFT","NFLX","GOOGL","AMZN","TSLA","AVGO","META","WMT","JPM","ORCL","V","LLY","MA","DIS",
+            "XOM","PLTR","COST","JNJ","HD","PG","ABBV","BAC","CVX","KO","GE",
+            # additions 29–150 (DIS deduped)
+            "CSCO","AMD","TMUS","PM","WFC","ABT","CRM","MS","UNH","IBM","LIN","MCD","GS","INTU","RTX","AXP",
+            "MRK","T","PEP","CAT","UBER","VZ","NOW","GEV","SCHW","BKNG","ANET","BLK","TMO","BA","C","TXN",
+            "SPGI","ISRG","QCOM","AMGN","BSX","NEE","ACN","GILD","AMAT","TJX","ADBE","PGR","SYK","DHR","ETN",
+            "PFE","DE","HON","LOW","APH","COF","MU","BX","UNP","LRCX","KKR","ADP","KLAC","MDT","COP","CMCSA",
+            "SNPS","WELL","PANW","ADI","DASH","NKE","CB","MO","ICE","CRWD","CEG","SBUX","SO","CME","MMC","LMT",
+            "PLD","DUK","AMT","CDNS","TT","WM","VRTX","BMY","DELL","PH","MCO","CTAS","HCA","SHW","ORLY","INTC",
+            "GD","MCK","NOC","CVS","RCL","MMM","APO","MDLZ","COIN","AON","TDG","ECL","EQIX","NEM","MSI","ITW",
+            "PNC","EMR","ABNB","AJG","RSG","UPS","CI","HWM","BK","FI"
+        ]
+
+        # Equities on MINUTE (spot ready after 9:30)
+        self.equitySymbols = {}
+        for t in self.tickers:
+            eq = self.AddEquity(t, Resolution.Minute)
+            self.equitySymbols[t] = eq.Symbol
+
+        # Buy & Hold benchmark (equal-weight across ALL tickers)
+        self.bh_initialized = False
+        self.bh_shares = {t: 0.0 for t in self.tickers}
+        self.bh_value = 0.0
+        self.bh_start_value = float(self.Portfolio.Cash)
+
+        # Window state
+        self.windowOpen = False
+        self.windowHadDecision = False
+        self.scores = {}         # ticker -> score
+        self.reasons = {}        # ticker -> reason
+        self.targets = {}        # ticker -> chosen CONTRACT Symbol
+        self.optionSymbols = {}  # ticker -> canonical OPTION Symbol (only inside window)
+
+        # 2-week cadence
+        self.lastWindowDate: date | None = None  # last day we actually opened a window
+
+        self.SetWarmUp(timedelta(days=1))  # short warmup
+
+        # Schedules (use AAPL's calendar) — run checks daily, but only act every 14 days
+        ref = self.equitySymbols["AAPL"]
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(9, 10), self.PrepareIfDue)
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(9, 35), self.OpenIfDue)
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(11, 0), self.CloseIfOpen)
+
+    # ---------------------- 2-week cadence helpers ----------------------
+
+    def _due(self) -> bool:
+        """Return True if it's time to run a new window (>=14 calendar days since last)."""
+        if self.lastWindowDate is None:
+            return True
+        return (self.Time.date() - self.lastWindowDate).days >= 14
+
+    # ---------------------- Orchestration ----------------------
+
+    def PrepareIfDue(self):
+        if not self._due():
+            return
+        self._remove_all_option_subscriptions()
+        self.targets.clear()
+        self.optionSymbols.clear()
+        self.scores.clear()
+        self.reasons.clear()
+        picked = self._select_and_subscribe_contracts()
+        self.Debug(f"Pre-warm @ {self.Time}: selected {picked} contracts")
+
+    def OpenIfDue(self):
+        if not self._due():
+            return
+        self.windowOpen = True
+        self.windowHadDecision = False
+        self.scores.clear()
+        self.reasons.clear()
+        if not self.targets:
+            picked = self._select_and_subscribe_contracts()
+            self.Debug(f"Window OPEN @ {self.Time} | selected {picked} contracts")
+        else:
+            self.Debug(f"Window OPEN @ {self.Time} | pre-warmed targets: {len(self.targets)}")
+        self.lastWindowDate = self.Time.date()
+
+    def CloseIfOpen(self):
+        if not self.windowOpen:
+            return
+
+        ordered = sorted(self.scores.items(), key=lambda kv: kv[1], reverse=True)
+        lines = []
+        for t in self.tickers:
+            if t in self.scores:
+                lines.append(f"{t}:{self.scores[t]:.3f}")
+            else:
+                lines.append(f"{t}:N/A ({self.reasons.get(t,'missing')})")
+        self.Debug(f"Scores @ {self.Time}: " + ", ".join(lines))
+
+        if ordered and not self.windowHadDecision:
+            self.RotateHoldings(ordered)
+        elif not ordered:
+            self.Debug("No valid scores — staying in current holdings")
+
+        self.windowOpen = False
+        self._remove_all_option_subscriptions()
+        self.Debug(f"Window CLOSE @ {self.Time}")
+
+    # ---------------------- Selection & subscriptions ----------------------
+
+    def _select_and_subscribe_contracts(self):
+        """
+        For each ticker:
+          - Add canonical option (minute) for the window
+          - From OptionChainProvider: pick CALL in 10–18 DTE, expiry closest to 14 DTE,
+            strike nearest +2% OTM
+          - Subscribe to the exact contract so Greeks/IV can populate
+        Returns number of chosen contracts.
+        """
+        picked = 0
+        for t in self.tickers:
+            try:
+                opt = self.AddOption(t, Resolution.Minute)
+                # Narrow chain to 10–18 DTE to match the shorter horizon
+                opt.SetFilter(-10, +10, timedelta(10), timedelta(18))
+                self.optionSymbols[t] = opt.Symbol
+
+                contracts = list(self.OptionChainProvider.GetOptionContractList(self.equitySymbols[t], self.Time))
+                if not contracts:
+                    self.reasons[t] = "no contracts from provider"
+                    continue
+
+                def dte_days(c): return (c.ID.Date.date() - self.Time.date()).days
+                calls = [c for c in contracts if c.ID.OptionRight == OptionRight.Call and 10 <= dte_days(c) <= 18]
+                if not calls:
+                    self.reasons[t] = "no 10–18d calls"
+                    continue
+
+                # Expiry closest to 14 DTE
+                expiries = {}
+                for c in calls:
+                    expiry = c.ID.Date.date()
+                    expiries[expiry] = (c.ID.Date.date() - self.Time.date()).days
+                best_expiry = min(expiries.items(), key=lambda kv: abs(kv[1] - 14))[0]
+
+                # Strike nearest +2% OTM
+                spot = self.Securities[self.equitySymbols[t]].Price
+                if spot <= 0:
+                    self.reasons[t] = "bad price"
+                    continue
+                target_strike = spot * 1.02
+                same_expiry = [c for c in calls if c.ID.Date.date() == best_expiry]
+                chosen = min(same_expiry, key=lambda s: abs(s.ID.StrikePrice - target_strike))
+
+                self.AddOptionContract(chosen)
+                self.targets[t] = chosen
+                picked += 1
+            except Exception as e:
+                self.reasons[t] = f"provider error: {e}"
+        return picked
+
+    def _remove_all_option_subscriptions(self):
+        # Remove contract subscriptions
+        for sym in list(self.targets.values()):
+            if sym in self.Securities:
+                self.RemoveSecurity(sym)
+        # Remove canonical option subscriptions
+        for sym in list(self.optionSymbols.values()):
+            if sym in self.Securities:
+                self.RemoveSecurity(sym)
+
+    # ---------------------- Scoring (Slice first, DF fallback) ----------------------
+
+    def _score_from_slice(self, t: str, data: Slice):
+        if t not in self.targets or t not in self.optionSymbols:
+            return None, self.reasons.get(t, "no target/canonical")
+
+        chain = data.OptionChains.get(self.optionSymbols[t])
+        if chain is None:
+            return None, "no chain in slice"
+
+        target_symbol = self.targets[t]
+        contract = next((c for c in chain if c.Symbol == target_symbol), None)
+        if contract is None:
+            return None, "target not in chain yet"
+
+        delta = contract.Greeks.Delta if contract.Greeks is not None else None
+        iv = contract.ImpliedVolatility
+        if delta is None or iv is None or iv == 0:
+            return None, "missing greeks/iv"
+
+        return abs(float(delta)) / float(iv), ""
+
+    def _score_from_provider_df(self, t: str):
+        try:
+            if t not in self.optionSymbols:
+                return None, self.reasons.get(t, "no canonical")
+            df = self.OptionChain(self.optionSymbols[t], flatten=True).data_frame
+            if df is None or df.empty:
+                return None, "empty df"
+
+            right = df['right'].astype(str).str.upper().str[0]
+            df = df[(right == 'C') & (df['expiry'] > self.Time)]
+            if df.empty:
+                return None, "no calls in df"
+
+            dte = (df['expiry'] - self.Time).dt.days
+            df = df[dte.between(10, 18)]
+            if df.empty:
+                return None, "no 10–18d in df"
+
+            df = df.assign(dte=(df['expiry'] - self.Time).dt.days)
+            target_expiry = df.iloc[(df['dte'] - 14).abs().argsort()].iloc[0]['expiry']
+            sub = df[df['expiry'] == target_expiry]
+            if sub.empty:
+                return None, "no rows at chosen expiry"
+
+            spot = sub['underlyinglastprice'].iloc[0]
+            if not spot or spot <= 0:
+                return None, "bad price df"
+            target = spot * 1.02
+
+            sub = sub.assign(abs_strike_delta=(sub['strike'] - target).abs())
+            row = sub.loc[sub['abs_strike_delta'].idxmin()]
+
+            iv = float(row.get('impliedvolatility', float('nan')))
+            delta = float(row.get('delta', float('nan')))
+            if not (iv and delta) or iv == 0 or (delta != delta) or (iv != iv):
+                return None, "df missing greeks/iv"
+
+            return abs(delta) / iv, ""
+        except Exception as e:
+            return None, f"df error: {e}"
+
+    # ---------------------- OnData ----------------------
+
+    def OnData(self, data: Slice):
+        # Initialize equal-weight buy & hold (no rebalance)
+        if not self.IsWarmingUp and not self.bh_initialized:
+            per = self.bh_start_value / float(len(self.tickers))
+            for t in self.tickers:
+                px = self.Securities[self.equitySymbols[t]].Price
+                if px > 0:
+                    self.bh_shares[t] = per / px
+            self.bh_initialized = True
+
+        # Splits
+        for kvp in data.Splits:
+            sym = kvp.Key
+            t = next((k for k, v in self.equitySymbols.items() if v == sym), None)
+            if t:
+                self.bh_shares[t] *= kvp.Value.SplitFactor
+
+        # Update B&H value
+        if self.bh_initialized:
+            self.bh_value = sum(self.bh_shares[t] * self.Securities[self.equitySymbols[t]].Price for t in self.tickers)
+
+        # Only evaluate during an open window
+        if self.IsWarmingUp or not self.windowOpen:
+            return
+
+        # Compute scores (slice first, then DF fallback)
+        for t in self.tickers:
+            if t in self.scores or t in self.reasons:
+                continue
+            score, reason = self._score_from_slice(t, data)
+            if score is None:
+                score, reason = self._score_from_provider_df(t)
+            if score is not None:
+                self.scores[t] = score
+            else:
+                self.reasons[t] = reason
+
+        # Trade as soon as we have any scores
+        if self.scores and not self.windowHadDecision:
+            ordered = sorted(self.scores.items(), key=lambda kv: kv[1], reverse=True)
+            self.RotateHoldings(ordered)
+            self.windowHadDecision = True
+
+    # ---------------------- Rotation (Top 3: 0.34 / 0.33 / 0.33) ----------------------
+
+    def RotateHoldings(self, ranked_scores):
+        top = ranked_scores[:3]
+        picks = [t for t, _ in top]
+        weights = [0.34, 0.33, 0.33][:len(top)]
+        s = sum(weights)
+        if s != 1.0:
+            weights = [w / s for w in weights]
+
+        self.Liquidate()
+        for t, w in zip(picks, weights):
+            self.SetHoldings(self.equitySymbols[t], w)
+        self.Debug(f"Rotating into (Top 3): {list(zip(picks, [round(w,3) for w in weights]))}")
+
+    # ---------------------- End-of-Algorithm Reporting ----------------------
+
+    def OnEndOfAlgorithm(self):
+        if self.bh_initialized and self.bh_start_value > 0:
+            bh_ret = (self.bh_value / self.bh_start_value) - 1.0
+            strat_ret = (self.Portfolio.TotalPortfolioValue / self.bh_start_value) - 1.0
+            self.Debug(f"Buy&Hold return (equal-weight, all tickers): {bh_ret:.2%}")
+            self.Debug(f"Strategy return: {strat_ret:.2%}")
