@@ -1,0 +1,348 @@
+from AlgorithmImports import *
+from datetime import timedelta, date
+import math
+
+class DeltaIV_LogFast(QCAlgorithm):
+    def Initialize(self):
+        # -------- Backtest params --------
+        self.SetStartDate(2024, 1, 1)
+        self.SetEndDate(2025, 1, 1)
+        self.SetCash(100000)
+
+        # Universe
+        self.tickers = [
+            "AAPL","MSFT","NFLX","GOOGL","AMZN","TSLA","AVGO","META",
+            "WMT","NVDA","JPM","ORCL","V","LLY","MA","DIS",
+            "XOM","PLTR","COST","JNJ","HD","PG","ABBV","BAC","CVX","KO","GE"
+        ]
+
+        # Equities MINUTE for spot (RAW); options HOURLY to keep it light
+        self.equity = {}
+        self.canonical = {}
+        for t in self.tickers:
+            eq = self.AddEquity(t, Resolution.Minute, dataNormalizationMode=DataNormalizationMode.Raw)
+            self.equity[t] = eq.Symbol
+            self.canonical[t] = self.AddOption(t, Resolution.Hour).Symbol
+
+        # ------ Option selection for stock scoring (30d window) ------
+        self.DTE_MIN, self.DTE_MAX, self.DTE_TARGET = 20, 45, 30   # days
+        self.OTM_FACTOR = 1.015                                     # ~ +1.5% OTM
+        # Top-5 equal weights (rescaled if <5 scored)
+        self.TOP_WEIGHTS = [0.20, 0.20, 0.20, 0.20, 0.20]
+
+        # ------ Rebalance cadence ------
+        self.period_days = 30
+        self.lastWindowDate = None
+        self.windowOpen = False
+        self.scores, self.reasons = {}, {}
+
+        # Buy & hold benchmark (equal-weight, no rebalance)
+        self.bh_initialized = False
+        self.bh_shares = {t: 0.0 for t in self.tickers}
+        self.bh_start_value = float(self.Portfolio.Cash)
+        self.bh_value = 0.0
+
+        # ---- Logging: capture inputs now, realized returns 90 days later ----
+        self.pending = []     # list[dict] queued for 90d realized return
+        self.completed = []   # CSV lines to persist
+        self.csv_header = "time,ticker,delta,iv,score,spot,dte,expiry,strike,is_winner,ret_90d\n"
+
+        # ====== QQQ Put Hedge (long-dated) ======
+        self.HEDGE_INDEX = "QQQ"
+        hedge_eq = self.AddEquity(self.HEDGE_INDEX, Resolution.Minute, dataNormalizationMode=DataNormalizationMode.Raw)
+        self.hedge_underlying = hedge_eq.Symbol
+        self.hedge_symbol = None
+        self.hedge_expiry = None
+        self.hedge_strike = None
+
+        self.HEDGE_DTE_TARGET = 90      # aim ~90 days
+        self.HEDGE_ROLL_DAYS  = 15      # roll when < 15 days remain
+        self.HEDGE_OTM_PCT    = 0.90    # ~10% OTM put
+        self.HEDGE_COVERAGE   = 0.50    # hedge ~50% of portfolio notional
+
+        # Deferred hedge order qty (place in OnData once first bar arrives)
+        self.hedge_pending_qty = 0
+
+        # Schedules: check daily; decisions at your existing times
+        ref = self.equity["AAPL"]
+        self.SetWarmUp(timedelta(days=1))
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(9, 35), self.OpenIfDue)
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(10, 45), self.DecideIfOpen)
+        self.Schedule.On(self.DateRules.EveryDay(ref), self.TimeRules.At(15, 55), self.ProcessPending)
+
+        # Maintain/roll hedge once a day after open
+        self.Schedule.On(self.DateRules.EveryDay(self.hedge_underlying), self.TimeRules.At(10, 5), self.MaintainPutHedge)
+
+    # ------------- cadence helpers -------------
+    def _due(self) -> bool:
+        if self.lastWindowDate is None:
+            return True
+        return (self.Time.date() - self.lastWindowDate).days >= self.period_days
+
+    # ------------- window orchestration -------------
+    def OpenIfDue(self):
+        if self.IsWarmingUp or not self._due():
+            return
+        self.windowOpen = True
+        self.scores.clear()
+        self.reasons.clear()
+
+    def DecideIfOpen(self):
+        if not self.windowOpen:
+            return
+
+        # Score all tickers via flattened DF (no per-contract subs)
+        for t in self.tickers:
+            if t in self.scores or t in self.reasons:
+                continue
+            pack = self._score_via_df(t)
+            if pack is None:
+                continue
+            (score, delta, iv, spot, dte, expiry, strike) = pack
+            self.scores[t] = score
+            # Queue for 90d realized return logging
+            self.pending.append({
+                "open_date": self.Time.date(),
+                "due_date":  self.Time.date() + timedelta(days=90),
+                "ticker":    t,
+                "spot":      spot,
+                "delta":     delta,
+                "iv":        iv,
+                "score":     score,
+                "dte":       dte,
+                "expiry":    expiry.date(),
+                "strike":    strike,
+                "is_winner": 0
+            })
+
+        if not self.scores:
+            # Nothing scored this window; close it and move on
+            self.windowOpen = False
+            self.lastWindowDate = self.Time.date()
+            return
+
+        # Rank & rotate into top 5 (equal weights; rescale if <5)
+        ordered = sorted(self.scores.items(), key=lambda kv: kv[1], reverse=True)
+        picks = [t for t, _ in ordered[:5]]
+
+        weights = self.TOP_WEIGHTS[:len(picks)]
+        s = sum(weights)
+        if s != 1.0 and s > 0:
+            weights = [w / s for w in weights]
+
+        self.Liquidate()
+        for t, w in zip(picks, weights):
+            self.SetHoldings(self.equity[t], w)
+
+        # Mark winners in pending for this open date
+        today = self.Time.date()
+        winners = set(picks)
+        for row in self.pending:
+            if row["open_date"] == today and row["ticker"] in winners:
+                row["is_winner"] = 1
+
+        self.windowOpen = False
+        self.lastWindowDate = self.Time.date()
+
+        # Initialize Buy&Hold on first decision day
+        if not self.bh_initialized:
+            per = self.bh_start_value / float(len(self.tickers))
+            for t in self.tickers:
+                px = self.Securities[self.equity[t]].Price
+                if px > 0:
+                    self.bh_shares[t] = per / px
+            self.bh_initialized = True
+
+    # ------------- scoring via flattened chain DF -------------
+    def _score_via_df(self, t: str):
+        """Return (score=|delta|, delta, iv, spot, dte, expiry, strike) or None (delta-only ranking)."""
+        try:
+            df = self.OptionChain(self.canonical[t], flatten=True).data_frame
+            if df is None or df.empty:
+                self.reasons[t] = "empty df"
+                return None
+
+            # calls only, future expiries
+            right = df['right'].astype(str).str.upper().str[0]
+            df = df[(right == 'C') & (df['expiry'] > self.Time)]
+            if df.empty:
+                self.reasons[t] = "no calls"
+                return None
+
+            # DTE filter 20–45, target ~30
+            dte = (df['expiry'] - self.Time).dt.days
+            df = df[dte.between(self.DTE_MIN, self.DTE_MAX)]
+            if df.empty:
+                self.reasons[t] = f"no {self.DTE_MIN}-{self.DTE_MAX}d"
+                return None
+
+            df = df.assign(dte=(df['expiry'] - self.Time).dt.days)
+            target_expiry = df.iloc[(df['dte'] - self.DTE_TARGET).abs().argsort()].iloc[0]['expiry']
+            sub = df[df['expiry'] == target_expiry]
+            if sub.empty:
+                self.reasons[t] = "no rows @ target expiry"
+                return None
+
+            spot = float(sub['underlyinglastprice'].iloc[0])
+            if not spot or spot <= 0:
+                self.reasons[t] = "bad spot"
+                return None
+
+            # Aim for ~ +1.5% OTM
+            target = spot * self.OTM_FACTOR
+            sub = sub.assign(abs_strike_delta=(sub['strike'] - target).abs())
+            row = sub.loc[sub['abs_strike_delta'].idxmin()]
+
+            iv = float(row.get('impliedvolatility', float('nan')))
+            delta = float(row.get('delta', float('nan')))
+            if not (iv and delta) or iv == 0 or (delta != delta) or (iv != iv):
+                self.reasons[t] = "missing greeks"
+                return None
+
+            score = abs(delta)  # DELTA-ONLY ranking
+            return score, float(delta), float(iv), float(spot), int(row['dte']), row['expiry'], float(row['strike'])
+        except Exception as e:
+            self.reasons[t] = f"df err:{e}"
+            return None
+
+    # ====== QQQ Put Hedge maintenance ======
+    def MaintainPutHedge(self):
+        """Keep a rolling QQQ put hedge (~90DTE, ~10% OTM) sized to ~50% notional coverage."""
+        try:
+            # Ensure underlying has a price/bar
+            sec_u = self.Securities[self.hedge_underlying]
+            if not (sec_u and sec_u.HasData and sec_u.Price and sec_u.Price > 0):
+                return
+            spot = sec_u.Price
+
+            # Roll if no hedge or within HEDGE_ROLL_DAYS of expiry
+            need_new = False
+            if self.hedge_symbol is None or self.hedge_expiry is None:
+                need_new = True
+            else:
+                days_left = (self.hedge_expiry.date() - self.Time.date()).days
+                if days_left <= self.HEDGE_ROLL_DAYS:
+                    need_new = True
+
+            if need_new:
+                # Liquidate existing hedge (if any)
+                if self.hedge_symbol and self.Portfolio[self.hedge_symbol].Invested:
+                    self.Liquidate(self.hedge_symbol)
+
+                # Find contracts around target DTE, put side
+                contracts = self.OptionChainProvider.GetOptionContractList(self.hedge_underlying, self.Time)
+                puts = [x for x in contracts if x.ID.OptionRight == OptionRight.Put and (x.ID.Date - self.Time).days > 0]
+                if not puts:
+                    self.Debug("Hedge: no future QQQ puts available")
+                    return
+
+                # Choose expiry closest to HEDGE_DTE_TARGET
+                expiry = min(puts, key=lambda s: abs((s.ID.Date - self.Time).days - self.HEDGE_DTE_TARGET)).ID.Date
+
+                # Choose strike closest to 10% OTM (spot*0.90)
+                target_k = spot * self.HEDGE_OTM_PCT
+                strikes = sorted({x.ID.StrikePrice for x in puts if x.ID.Date == expiry})
+                if not strikes:
+                    self.Debug("Hedge: no strikes for chosen expiry")
+                    return
+                strike = min(strikes, key=lambda k: abs(k - target_k))
+
+                # Subscribe that specific contract at MINUTE resolution (faster first bar)
+                chosen = [x for x in puts if x.ID.Date == expiry and x.ID.StrikePrice == strike][0]
+                self.hedge_symbol = self.AddOptionContract(chosen, Resolution.Minute).Symbol
+                self.hedge_expiry = expiry
+                self.hedge_strike = strike
+
+                # Size hedge ~50% of portfolio notional
+                coverage_notional = self.HEDGE_COVERAGE * self.Portfolio.TotalPortfolioValue
+                qty = max(1, math.ceil(coverage_notional / (spot * 100.0)))
+
+                # Defer the order until we actually have a bar/price in OnData
+                self.hedge_pending_qty = qty
+                self.Debug(f"Hedge roll -> selected QQQ put K={strike:.2f}, exp={expiry.date()}, "
+                           f"spot={spot:.2f}. Waiting for first bar to trade.")
+            else:
+                # Optional: re-size if portfolio changed a lot (skip to keep costs/turnover low)
+                pass
+
+        except Exception as e:
+            self.Debug(f"Hedge error: {e}")
+
+    # ------------- OnData: place any deferred hedge order when data arrives -------------
+    def OnData(self, slice: Slice):
+        # Fire deferred hedge order once we have a bar/price
+        if self.hedge_symbol and self.hedge_pending_qty > 0:
+            sec = self.Securities[self.hedge_symbol]
+            if slice.ContainsKey(self.hedge_symbol) and sec.HasData and sec.Price and sec.Price > 0:
+                qty = self.hedge_pending_qty
+                self.MarketOrder(self.hedge_symbol, qty)
+                self.Debug(f"Hedge filled -> QQQ put qty={qty}, K={self.hedge_strike:.2f}, "
+                           f"exp={self.hedge_expiry.date()}, px~{sec.Price:.2f}")
+                self.hedge_pending_qty = 0
+
+    # ------------- process pending realized returns -------------
+    def ProcessPending(self):
+        """At 15:55, attach 90-day realized return to entries that are due and flush to ObjectStore."""
+        if not self.pending:
+            # update B&H value daily (for final stats)
+            if self.bh_initialized:
+                self.bh_value = sum(self.Securities[self.equity[t]].Price * self.bh_shares[t] for t in self.tickers)
+            return
+
+        today = self.Time.date()
+        flush_rows = []
+        still_waiting = []
+
+        for row in self.pending:
+            if row["due_date"] > today:
+                still_waiting.append(row)
+                continue
+
+            # compute realized return using current spot
+            sym = self.equity[row["ticker"]]
+            cur_px = self.Securities[sym].Price
+            if cur_px and cur_px > 0 and row["spot"] > 0:
+                ret = (cur_px / row["spot"]) - 1.0
+            else:
+                ret = float('nan')
+
+            # build CSV line
+            csv = (
+                "{time},{tic},{d:.6f},{iv:.6f},{sc:.6f},{sp:.6f},{dte},{exp},{k:.4f},{win},{ret:.6f}\n"
+                .format(
+                    time=row["open_date"], tic=row["ticker"], d=row["delta"], iv=row["iv"], sc=row["score"],
+                    sp=row["spot"], dte=row["dte"], exp=row["expiry"], k=row["strike"], win=row["is_winner"], ret=ret
+                )
+            )
+            flush_rows.append(csv)
+
+        # keep those not yet due
+        self.pending = still_waiting
+
+        if flush_rows:
+            self.completed.extend(flush_rows)
+            try:
+                content = self.csv_header + "".join(self.completed)
+                self.ObjectStore.Save("delta_iv_samples.csv", content)
+            except Exception as e:
+                self.Debug(f"ObjectStore save failed: {e}")
+
+        # update B&H value daily (for final stats)
+        if self.bh_initialized:
+            self.bh_value = sum(self.Securities[self.equity[t]].Price * self.bh_shares[t] for t in self.tickers)
+
+    # ------------- end report -------------
+    def OnEndOfAlgorithm(self):
+        # Final save
+        try:
+            content = self.csv_header + "".join(self.completed)
+            self.ObjectStore.Save("delta_iv_samples.csv", content)
+            self.Debug("Saved delta_iv_samples.csv to ObjectStore")
+        except Exception as e:
+            self.Debug(f"Final ObjectStore save failed: {e}")
+
+        if self.bh_initialized and self.bh_start_value > 0:
+            bh_ret = (self.bh_value / self.bh_start_value) - 1.0
+            strat_ret = (self.Portfolio.TotalPortfolioValue / self.bh_start_value) - 1.0
+            self.Debug(f"Buy&Hold (equal-weight) return: {bh_ret:.2%}")
+            self.Debug(f"Strategy return: {strat_ret:.2%}")
