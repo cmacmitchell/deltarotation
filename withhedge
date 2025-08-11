@@ -5,8 +5,8 @@ import math
 class DeltaIV_LogFast(QCAlgorithm):
     def Initialize(self):
         # -------- Backtest params --------
-        self.SetStartDate(2024, 1, 1)
-        self.SetEndDate(2025, 1, 1)
+        self.SetStartDate(2022, 1, 1)
+        self.SetEndDate(2023, 1, 1)
         self.SetCash(100000)
 
         # Universe
@@ -58,10 +58,10 @@ class DeltaIV_LogFast(QCAlgorithm):
         self.HEDGE_DTE_TARGET = 90      # aim ~90 days
         self.HEDGE_ROLL_DAYS  = 15      # roll when < 15 days remain
         self.HEDGE_OTM_PCT    = 0.90    # ~10% OTM put
-        self.HEDGE_COVERAGE   = 0.50    # hedge ~50% of portfolio notional
 
-        # Deferred hedge order qty (place in OnData once first bar arrives)
-        self.hedge_pending_qty = 0
+        # Allocate 10% of portfolio value (premium dollars) to the hedge
+        self.HEDGE_BUDGET_PCT = 0.10
+        self.hedge_pending_budget = 0.0  # dollars to spend once first bar arrives
 
         # Schedules: check daily; decisions at your existing times
         ref = self.equity["AAPL"]
@@ -86,6 +86,13 @@ class DeltaIV_LogFast(QCAlgorithm):
         self.windowOpen = True
         self.scores.clear()
         self.reasons.clear()
+
+    def _LiquidateEquitiesOnly(self):
+        """Liquidate only the equity legs, keep hedge intact."""
+        for t in self.tickers:
+            sym = self.equity[t]
+            if self.Portfolio[sym].Invested:
+                self.Liquidate(sym)
 
     def DecideIfOpen(self):
         if not self.windowOpen:
@@ -130,7 +137,9 @@ class DeltaIV_LogFast(QCAlgorithm):
         if s != 1.0 and s > 0:
             weights = [w / s for w in weights]
 
-        self.Liquidate()
+        # Liquidate only equities (preserve hedge)
+        self._LiquidateEquitiesOnly()
+
         for t, w in zip(picks, weights):
             self.SetHoldings(self.equity[t], w)
 
@@ -205,9 +214,9 @@ class DeltaIV_LogFast(QCAlgorithm):
             self.reasons[t] = f"df err:{e}"
             return None
 
-    # ====== QQQ Put Hedge maintenance ======
+    # ====== QQQ Put Hedge maintenance (10% premium budget) ======
     def MaintainPutHedge(self):
-        """Keep a rolling QQQ put hedge (~90DTE, ~10% OTM) sized to ~50% notional coverage."""
+        """Keep a rolling QQQ put hedge (~90DTE, ~10% OTM) with ~10% of portfolio value as premium budget."""
         try:
             # Ensure underlying has a price/bar
             sec_u = self.Securities[self.hedge_underlying]
@@ -253,14 +262,10 @@ class DeltaIV_LogFast(QCAlgorithm):
                 self.hedge_expiry = expiry
                 self.hedge_strike = strike
 
-                # Size hedge ~50% of portfolio notional
-                coverage_notional = self.HEDGE_COVERAGE * self.Portfolio.TotalPortfolioValue
-                qty = max(1, math.ceil(coverage_notional / (spot * 100.0)))
-
-                # Defer the order until we actually have a bar/price in OnData
-                self.hedge_pending_qty = qty
+                # Set a premium budget = 10% of current portfolio value; qty decided in OnData when price arrives
+                self.hedge_pending_budget = self.HEDGE_BUDGET_PCT * self.Portfolio.TotalPortfolioValue
                 self.Debug(f"Hedge roll -> selected QQQ put K={strike:.2f}, exp={expiry.date()}, "
-                           f"spot={spot:.2f}. Waiting for first bar to trade.")
+                           f"budget=${self.hedge_pending_budget:,.2f}. Waiting for first bar to trade.")
             else:
                 # Optional: re-size if portfolio changed a lot (skip to keep costs/turnover low)
                 pass
@@ -268,17 +273,26 @@ class DeltaIV_LogFast(QCAlgorithm):
         except Exception as e:
             self.Debug(f"Hedge error: {e}")
 
-    # ------------- OnData: place any deferred hedge order when data arrives -------------
+    # ------------- OnData: place deferred hedge order when data arrives -------------
     def OnData(self, slice: Slice):
         # Fire deferred hedge order once we have a bar/price
-        if self.hedge_symbol and self.hedge_pending_qty > 0:
-            sec = self.Securities[self.hedge_symbol]
-            if slice.ContainsKey(self.hedge_symbol) and sec.HasData and sec.Price and sec.Price > 0:
-                qty = self.hedge_pending_qty
-                self.MarketOrder(self.hedge_symbol, qty)
-                self.Debug(f"Hedge filled -> QQQ put qty={qty}, K={self.hedge_strike:.2f}, "
-                           f"exp={self.hedge_expiry.date()}, px~{sec.Price:.2f}")
-                self.hedge_pending_qty = 0
+        if self.hedge_symbol and self.hedge_pending_budget > 0:
+            if slice.ContainsKey(self.hedge_symbol):
+                sec = self.Securities[self.hedge_symbol]
+                if sec.HasData and sec.Price and sec.Price > 0:
+                    # Option prices are per share; contract is *100 shares
+                    contract_cost = sec.Price * 100.0
+                    qty = int(self.hedge_pending_budget // contract_cost)
+                    if qty <= 0:
+                        self.Debug(f"Hedge budget ${self.hedge_pending_budget:,.2f} too small for 1 contract "
+                                   f"(~${contract_cost:,.2f}). Skipping.")
+                        self.hedge_pending_budget = 0.0
+                        return
+                    self.MarketOrder(self.hedge_symbol, qty)
+                    self.Debug(f"Hedge filled -> QQQ put qty={qty}, K={self.hedge_strike:.2f}, "
+                               f"exp={self.hedge_expiry.date()}, px~{sec.Price:.2f}, "
+                               f"spent~${qty*contract_cost:,.2f}")
+                    self.hedge_pending_budget = 0.0
 
     # ------------- process pending realized returns -------------
     def ProcessPending(self):
