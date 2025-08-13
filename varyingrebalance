@@ -1,0 +1,260 @@
+from AlgorithmImports import *
+from datetime import timedelta, date
+
+class DeltaIV_AllNames(QCAlgorithm):
+    def Initialize(self):
+        # -------- Backtest params --------
+        self.SetStartDate(2021, 1, 1)
+        self.SetEndDate(2022, 1, 1)
+        self.SetCash(100000)
+
+        # ===== Regime driver: SPY SMA(25/50) =====
+        self.spy  = self.AddEquity("SPY", Resolution.Minute, dataNormalizationMode=DataNormalizationMode.Raw).Symbol
+        self.sma25 = self.SMA(self.spy, 25, Resolution.Daily)
+        self.sma50 = self.SMA(self.spy, 50, Resolution.Daily)
+
+        # ===== Flat universe =====
+        self.universe_all = sorted([
+            "AAPL","MSFT","NVDA","ADBE","AVGO","CRM","ORCL","CSCO","INTC","ACN","IBM","TXN",
+            "UNH","JNJ","LLY","PFE","TMO","ABT","ABBV",
+            "V","MA","JPM","GS","C","PYPL","BLK","BAC",
+            "AMZN","TSLA","MCD","NKE","HD","TJX","LOW","AZO",
+            "UPS","HON","ADP","CAT","BA","LMT","MMM","GE","RTX",
+            "GOOG","META","NFLX","DIS","CMCSA","VZ","T","WBD",
+            "PG","COST","KO","PEP","WMT","TGT","GIS","MO","STZ",
+            "XOM","CVX","COP","PXD","OXY","EOG","SLB","HAL","PSX",
+            "NEE","CEG","SO","DUK","VST","D","AEP","EXC","PEG",
+            "LIN","SHW","DOW","FCX","NEM","NUE","IP","ALB",
+            "PLD","EQIX","AMT","SPG","O","PSA","WELL","DLR"
+        ])
+
+        # ===== Data subscriptions =====
+        self.equity = {}
+        self.canonical = {}
+        for t in self.universe_all:
+            eq = self.AddEquity(t, Resolution.Minute, dataNormalizationMode=DataNormalizationMode.Raw)
+            self.equity[t] = eq.Symbol
+            self.canonical[t] = self.AddOption(t, Resolution.Hour).Symbol
+
+        # ------ Delta engine params ------
+        self.DTE_MIN, self.DTE_MAX, self.DTE_TARGET = 0, 10, 5
+        self.OTM_FACTOR = 1.015
+
+        # ------ State & logging ------
+        self.current_regime = None
+        self.current_names  = []
+        self.scores, self.reasons = {}, {}
+        self.pending = []
+        self.completed = []
+        self.csv_header = "time,ticker,delta,iv,score,spot,dte,expiry,strike,is_winner,ret_90d\n"
+
+        # Buy & hold benchmark
+        self.bh_initialized = False
+        self.bh_shares = {t: 0.0 for t in self.universe_all}
+        self.bh_start_value = float(self.Portfolio.Cash)
+        self.bh_value = 0.0
+
+        self.SetWarmUp(90, Resolution.Daily)
+
+        # ------ Rebalance cadence ------
+        self.period_days = 5
+        self.lastWindowDate = None
+        self.windowOpen = False
+
+        self.Schedule.On(self.DateRules.EveryDay(self.spy), self.TimeRules.At(9, 35), self.OpenIfDue)
+        self.Schedule.On(self.DateRules.EveryDay(self.spy), self.TimeRules.At(10, 45), self.DecideIfOpen)
+        self.Schedule.On(self.DateRules.EveryDay(self.spy), self.TimeRules.At(10, 5), self.RebalanceIfRegimeChanged)
+        self.Schedule.On(self.DateRules.EveryDay(self.spy), self.TimeRules.At(15, 55), self.ProcessPending)
+
+    # ========= Regime logic =========
+    def _get_regime(self):
+        if not (self.sma25.IsReady and self.sma50.IsReady):
+            return "ON"
+        px = self.Securities[self.spy].Price
+        if px >= self.sma25.Current.Value:
+            return "ON"
+        if px >= self.sma50.Current.Value:
+            return "MID"
+        return "OFF"
+
+    # ========= Cadence helpers =========
+    def _due(self):
+        if self.lastWindowDate is None:
+            return True
+        return (self.Time.date() - self.lastWindowDate).days >= self.period_days
+
+    def OpenIfDue(self):
+        if self.IsWarmingUp or not self._due():
+            return
+        self.windowOpen = True
+        self.scores.clear()
+        self.reasons.clear()
+
+    def RebalanceIfRegimeChanged(self):
+        if self.IsWarmingUp: return
+        reg = self._get_regime()
+        if reg != self.current_regime:
+            self.Debug(f"Regime change: {self.current_regime} -> {reg}")
+            self._score_all_and_apply(reg, "regime_change")
+
+    def DecideIfOpen(self):
+        if not self.windowOpen:
+            return
+        reg = self._get_regime()
+        self._score_all_and_apply(reg, "periodic_60d")
+        self.windowOpen = False
+        self.lastWindowDate = self.Time.date()
+
+        if not self.bh_initialized:
+            per = self.bh_start_value / len(self.universe_all)
+            for t in self.universe_all:
+                px = self.Securities[self.equity[t]].Price
+                if px > 0:
+                    self.bh_shares[t] = per / px
+            self.bh_initialized = True
+
+    # ========= Core: rank all names and pick top N =========
+    def _score_all_and_apply(self, regime, reason):
+        logs_today = []
+        scored = []
+
+        for t in self.universe_all:
+            pack = self._score_via_df(t)
+            if pack is None:
+                continue
+            (score, delta, iv, spot, dte, expiry, strike) = pack
+            scored.append((t, score))
+            logs_today.append({
+                "open_date": self.Time.date(),
+                "due_date":  self.Time.date() + timedelta(days=90),
+                "ticker":    t,
+                "spot":      spot,
+                "delta":     delta,
+                "iv":        iv,
+                "score":     score,
+                "dte":       dte,
+                "expiry":    expiry.date(),
+                "strike":    strike,
+                "is_winner": 0
+            })
+
+        if logs_today:
+            self.pending.extend(logs_today)
+
+        scored.sort(key=lambda x: x[1], reverse=True)
+        top_n = 7  # change this to however many you want to hold
+        picks = [t for t, _ in scored[:top_n]]
+
+        keep = set(picks)
+        for t in self.universe_all:
+            sym = self.equity[t]
+            if t not in keep and self.Portfolio[sym].Invested:
+                self.Liquidate(sym)
+
+        w = 1.0 / len(picks)
+        for t in picks:
+            self.SetHoldings(self.equity[t], w)
+
+        today = self.Time.date()
+        for row in self.pending:
+            if row["open_date"] == today and row["ticker"] in keep:
+                row["is_winner"] = 1
+
+        self.current_regime = regime
+        self.current_names = picks
+        self.Debug(f"{reason} applied. Regime={regime}, names={len(picks)}, weight each={w:.2%}")
+
+    # ========= Delta scoring =========
+    def _score_via_df(self, t):
+        try:
+            ch = self.OptionChain(self.canonical[t], flatten=True)
+            df = ch.data_frame if ch is not None else None
+            if df is None or df.empty: return None
+
+            right = df['right'].astype(str).str.upper().str[0]
+            df = df[(right == 'C') & (df['expiry'] > self.Time)]
+            if df.empty: return None
+
+            dte = (df['expiry'] - self.Time).dt.days
+            df = df[dte.between(self.DTE_MIN, self.DTE_MAX)]
+            if df.empty: return None
+
+            df = df.assign(dte=(df['expiry'] - self.Time).dt.days)
+            target_expiry = df.iloc[(df['dte'] - self.DTE_TARGET).abs().argsort()].iloc[0]['expiry']
+            sub = df[df['expiry'] == target_expiry]
+            if sub.empty: return None
+
+            spot = float(sub['underlyinglastprice'].iloc[0])
+            if spot <= 0: return None
+
+            target = spot * self.OTM_FACTOR
+            sub = sub.assign(abs_strike_delta=(sub['strike'] - target).abs())
+            row = sub.loc[sub['abs_strike_delta'].idxmin()]
+
+            iv = float(row.get('impliedvolatility', float('nan')))
+            delta = float(row.get('delta', float('nan')))
+            if iv == 0 or not iv or not delta or iv != iv or delta != delta:
+                return None
+
+            score = abs(delta)
+            return score, delta, iv, spot, int(row['dte']), row['expiry'], float(row['strike'])
+        except:
+            return None
+
+    # ========= 90-day realized returns logging =========
+    def ProcessPending(self):
+        if not self.pending:
+            if self.bh_initialized:
+                self.bh_value = sum(self.Securities[self.equity[t]].Price * self.bh_shares[t]
+                                    for t in self.universe_all if t in self.equity)
+            return
+
+        today = self.Time.date()
+        flush_rows, still_waiting = [], []
+
+        for row in self.pending:
+            if row["due_date"] > today:
+                still_waiting.append(row)
+                continue
+
+            sym = self.equity.get(row["ticker"])
+            cur_px = self.Securities[sym].Price if sym else None
+            if cur_px and cur_px > 0 and row["spot"] > 0:
+                ret = (cur_px / row["spot"]) - 1.0
+            else:
+                ret = float('nan')
+
+            csv = "{time},{tic},{d:.6f},{iv:.6f},{sc:.6f},{sp:.6f},{dte},{exp},{k:.4f},{win},{ret:.6f}\n".format(
+                time=row["open_date"], tic=row["ticker"], d=row["delta"], iv=row["iv"], sc=row["score"],
+                sp=row["spot"], dte=row["dte"], exp=row["expiry"], k=0.0,
+                win=row["is_winner"], ret=ret
+            )
+            flush_rows.append(csv)
+
+        self.pending = still_waiting
+
+        if flush_rows:
+            self.completed.extend(flush_rows)
+            try:
+                content = self.csv_header + "".join(self.completed)
+                self.ObjectStore.Save("delta_iv_samples.csv", content)
+            except Exception as e:
+                self.Debug(f"ObjectStore save failed: {e}")
+
+        if self.bh_initialized:
+            self.bh_value = sum(self.Securities[self.equity[t]].Price * self.bh_shares[t]
+                                for t in self.universe_all if t in self.equity)
+
+    def OnEndOfAlgorithm(self):
+        try:
+            content = self.csv_header + "".join(self.completed)
+            self.ObjectStore.Save("delta_iv_samples.csv", content)
+            self.Debug("Saved delta_iv_samples.csv to ObjectStore")
+        except Exception as e:
+            self.Debug(f"Final ObjectStore save failed: {e}")
+
+        if self.bh_initialized and self.bh_start_value > 0:
+            bh_ret = (self.bh_value / self.bh_start_value) - 1.0
+            strat_ret = (self.Portfolio.TotalPortfolioValue / self.bh_start_value) - 1.0
+            self.Debug(f"Buy&Hold (equal-weight) return: {bh_ret:.2%}")
+            self.Debug(f"Strategy return: {strat_ret:.2%}")
